@@ -1,0 +1,314 @@
+
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Spotify Library Exporter</title>
+<style>
+body{font-family:Arial,sans-serif;max-width:650px;margin:35px auto;padding:0 18px;line-height:1.5}
+input,button{box-sizing:border-box;width:100%;padding:13px;margin:8px 0;border-radius:8px;font-size:16px}
+input{border:1px solid #999}
+button{border:0;background:#1ed760;color:#102010;font-weight:bold}
+button:disabled{opacity:.5}
+.card{border:1px solid #999;border-radius:12px;padding:16px;margin:18px 0}
+progress{width:100%;height:18px}
+small{opacity:.75}
+#status{white-space:pre-wrap;overflow-wrap:anywhere}
+</style>
+</head>
+<body>
+<h1>Spotify Library Exporter</h1>
+<p>Herramienta personal de solo lectura. Solo solicita permiso para consultar tus canciones guardadas.</p>
+
+<div class="card">
+<label for="clientId"><b>Spotify Client ID</b></label>
+<input id="clientId" placeholder="Pega aquí tu Client ID">
+<small>No introduzcas tu Client Secret.</small>
+<p><b>Redirect URI:</b><br><code id="redirect"></code></p>
+<button id="connect">Conectar con Spotify</button>
+</div>
+
+<div class="card">
+<h2>Tu biblioteca</h2>
+<p id="account">Todavía no conectado.</p>
+<button id="download" disabled>Descargar mis canciones</button>
+<button id="stop" disabled>Detener descarga</button>
+<progress id="progress" value="0" max="1"></progress>
+<p id="status">Esperando autorización.</p>
+<div id="exports" hidden>
+<button id="json">Descargar archivo JSON</button>
+<button id="csv">Descargar archivo CSV</button>
+</div>
+</div>
+
+<script>
+(() => {
+const REDIRECT = location.origin + location.pathname;
+const API = "https://api.spotify.com/v1/me/tracks";
+const $ = id => document.getElementById(id);
+
+$("redirect").textContent = REDIRECT;
+$("clientId").value = localStorage.getItem("spotify_client_id") || "";
+
+let token = null;
+let songs = [];
+let stopped = false;
+let total = 0;
+
+function status(message) {
+  $("status").textContent = message;
+}
+
+function randomString(length) {
+  const chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~";
+  const bytes = crypto.getRandomValues(new Uint8Array(length));
+  return Array.from(bytes, b => chars[b % chars.length]).join("");
+}
+
+function base64url(buffer) {
+  return btoa(String.fromCharCode(...new Uint8Array(buffer)))
+    .replace(/\+/g, "-")
+    .replace(/\//g, "_")
+    .replace(/=+$/, "");
+}
+
+async function challenge(verifier) {
+  const digest = await crypto.subtle.digest(
+    "SHA-256",
+    new TextEncoder().encode(verifier)
+  );
+  return base64url(digest);
+}
+
+async function connect() {
+  const clientId = $("clientId").value.trim();
+  if (!clientId) {
+    alert("Primero introduce tu Spotify Client ID.");
+    return;
+  }
+
+  localStorage.setItem("spotify_client_id", clientId);
+
+  const verifier = randomString(64);
+  const state = randomString(32);
+  const codeChallenge = await challenge(verifier);
+
+  sessionStorage.setItem("spotify_verifier", verifier);
+  sessionStorage.setItem("spotify_state", state);
+
+  const params = new URLSearchParams({
+    client_id: clientId,
+    response_type: "code",
+    redirect_uri: REDIRECT,
+    code_challenge_method: "S256",
+    code_challenge: codeChallenge,
+    scope: "user-library-read",
+    state
+  });
+
+  location.href = "https://accounts.spotify.com/authorize?" + params;
+}
+
+async function callback() {
+  const params = new URLSearchParams(location.search);
+  const code = params.get("code");
+  const error = params.get("error");
+
+  if (error) {
+    status("Spotify rechazó la autorización: " + error);
+    history.replaceState({}, "", REDIRECT);
+    return;
+  }
+
+  if (!code) return;
+
+  const state = params.get("state");
+  const savedState = sessionStorage.getItem("spotify_state");
+  const verifier = sessionStorage.getItem("spotify_verifier");
+
+  history.replaceState({}, "", REDIRECT);
+
+  if (!savedState || state !== savedState || !verifier) {
+    status("No se pudo validar la autorización. Intenta conectar de nuevo.");
+    return;
+  }
+
+  try {
+    const body = new URLSearchParams({
+      client_id: localStorage.getItem("spotify_client_id"),
+      grant_type: "authorization_code",
+      code,
+      redirect_uri: REDIRECT,
+      code_verifier: verifier
+    });
+
+    const response = await fetch("https://accounts.spotify.com/api/token", {
+      method: "POST",
+      headers: {"Content-Type": "application/x-www-form-urlencoded"},
+      body
+    });
+
+    const data = await response.json();
+
+    if (!response.ok) {
+      throw new Error(data.error_description || data.error || response.status);
+    }
+
+    token = data.access_token;
+
+    sessionStorage.removeItem("spotify_verifier");
+    sessionStorage.removeItem("spotify_state");
+
+    $("account").textContent = "Conectado correctamente a Spotify.";
+    $("download").disabled = false;
+    status("Autorización correcta. Ya puedes descargar tu biblioteca.");
+
+  } catch (e) {
+    status("Error de autorización: " + e.message);
+  }
+}
+
+const wait = ms => new Promise(resolve => setTimeout(resolve, ms));
+
+async function getPage(offset) {
+  for (let attempt = 0; attempt < 5; attempt++) {
+    const response = await fetch(
+      API + "?limit=50&offset=" + offset,
+      {headers: {Authorization: "Bearer " + token}}
+    );
+
+    if (response.status === 429) {
+      const seconds = Number(response.headers.get("Retry-After") || 3);
+      status("Límite temporal de Spotify. Esperando " + seconds + " segundos...");
+      await wait(seconds * 1000);
+      continue;
+    }
+
+    const data = await response.json();
+
+    if (!response.ok) {
+      throw new Error(data.error?.message || "HTTP " + response.status);
+    }
+
+    return data;
+  }
+
+  throw new Error("Spotify sigue limitando las consultas. Inténtalo más tarde.");
+}
+
+async function downloadAll() {
+  if (!token) return;
+
+  songs = [];
+  stopped = false;
+  total = 0;
+
+  $("download").disabled = true;
+  $("stop").disabled = false;
+  $("exports").hidden = true;
+
+  try {
+    let offset = 0;
+
+    while (!stopped) {
+      const page = await getPage(offset);
+      total = page.total;
+
+      $("progress").max = Math.max(total, 1);
+
+      if (!page.items || page.items.length === 0) break;
+
+      songs.push(...page.items);
+      offset += page.items.length;
+
+      $("progress").value = songs.length;
+      $("exports").hidden = false;
+
+      status("Recuperadas " + songs.length + " de " + total + " canciones.");
+
+      if (!page.next || offset >= total) break;
+
+      await wait(150);
+    }
+
+    status(
+      (stopped ? "Descarga detenida. " : "Descarga completada. ") +
+      songs.length + " de " + total + " canciones recuperadas."
+    );
+
+  } catch (e) {
+    status("Error después de recuperar " + songs.length +
+      " canciones: " + e.message +
+      ". Puedes descargar lo recuperado.");
+  } finally {
+    $("download").disabled = !token;
+    $("stop").disabled = true;
+    $("exports").hidden = songs.length === 0;
+  }
+}
+
+function saveFile(filename, content, type) {
+  const blob = new Blob([content], {type});
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 2000);
+}
+
+function csvCell(value) {
+  return '"' + String(value ?? "").replace(/"/g, '""') + '"';
+}
+
+$("connect").addEventListener("click", connect);
+$("download").addEventListener("click", downloadAll);
+$("stop").addEventListener("click", () => {
+  stopped = true;
+  $("stop").disabled = true;
+});
+
+$("json").addEventListener("click", () => {
+  saveFile(
+    "spotify-liked-songs.json",
+    JSON.stringify({total, exported: songs.length, items: songs}, null, 2),
+    "application/json;charset=utf-8"
+  );
+});
+
+$("csv").addEventListener("click", () => {
+  const rows = [[
+    "added_at", "name", "artists", "album",
+    "spotify_uri", "spotify_id", "duration_ms", "explicit", "spotify_url"
+  ]];
+
+  for (const item of songs) {
+    const track = item.track || {};
+    rows.push([
+      item.added_at,
+      track.name,
+      (track.artists || []).map(a => a.name).join(", "),
+      track.album?.name,
+      track.uri,
+      track.id,
+      track.duration_ms,
+      track.explicit,
+      track.external_urls?.spotify
+    ]);
+  }
+
+  const csv = "\uFEFF" + rows.map(row =>
+    row.map(csvCell).join(",")
+  ).join("\r\n");
+
+  saveFile("spotify-liked-songs.csv", csv, "text/csv;charset=utf-8");
+});
+
+callback();
+})();
+</script>
+</body>
+</html>
